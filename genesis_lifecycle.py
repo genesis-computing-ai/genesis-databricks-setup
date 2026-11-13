@@ -1,4 +1,17 @@
 # Databricks notebook source
+# MAGIC %md
+# MAGIC # Genesis setup
+# MAGIC Installs, checks and removes Genesis as a Databricks App. Run it as a workspace admin.
+# MAGIC
+# MAGIC 1. Click **Run all** (top right). The **Genesis setup** form opens at the bottom of this page.
+# MAGIC 2. Pick an **Action**: start with **preinstall**; after installing the App, run **postinstall**.
+# MAGIC    **status** shows where an install stands and what to do next, and changes nothing.
+# MAGIC 3. Check the values (the defaults fit most installs), then press the **Run** button.
+# MAGIC
+# MAGIC Keep this notebook in a folder you keep (not Drafts): a job runs it to restart the App if it crashes.
+
+# COMMAND ----------
+
 # Copyright (c) 2026 Genesis Computing, Inc.
 """Install, check and uninstall Genesis as a Databricks App — run by a workspace admin.
 
@@ -22,20 +35,23 @@ notebook only ever adopts or deletes what carries its own install id.
   is never replaced (a new key makes every secret Genesis stored unreadable). A resource with the same name that carries
   another install id, or none, is never adopted: pick another ``app_name``. Ends by printing
   what to enter in the install form, field by field: the App name, each resource it
-  created, the newest Claude Sonnet and the default embedding endpoint when they are ready,
+  created, the newest Claude Opus (else Sonnet) and the default embedding endpoint when they are ready,
   and a SQL warehouse (serverless and running first).
 - **postinstall** — after installing: checks that the App binds every resource
   ``app.yaml`` needs with the least privilege it needs, runs one instance, and has the
   user-authorization scopes Genesis needs (sign-in, and ``sql`` for agent SQL as the user)
   and no other; then grants the App's service principal what its lakehouse needs on the
-  lakehouse schema only (:data:`LAKEHOUSE_PRIVILEGES`; the App can exist only after
-  preinstall, so this is the first moment its principal can be named); prints its state
+  lakehouse schema only (:data:`LAKEHOUSE_PRIVILEGES`, then :data:`EXTERNAL_USE_SCHEMA` on
+  its own: where Unity Catalog cannot grant it, the install completes and says why the
+  lakehouse is unavailable; the App can exist only after preinstall, so this is the first
+  moment its principal can be named); prints its state
   and URL, and schedules the watchdog (below) when run from the imported notebook.
 - **grant_data** — after postinstall: lets Genesis read the customer's existing data with
   no person signed in (scheduled jobs, missions, scans) through its
   ``genesis_databricks_app`` connection. That SQL never runs as the App's own service
   principal, which can read the App's master key: the first run creates a **data reader**,
-  the service principal ``<app_name>-data-reader`` with no access to the App's secret scope,
+  the service principal ``<app_name>-data-reader-<install id prefix>`` with no access to the
+  App's secret scope (found by the client id kept there, whatever its name),
   keeps its OAuth secret in the App's scope (``data-reader``) for the App to sign in as it
   with, and lets it use the App's SQL warehouse. ``data`` lists catalogs or
   ``catalog.schema`` names; the reader gets read only (:data:`DATA_CATALOG_PRIVILEGES` on
@@ -59,9 +75,9 @@ notebook only ever adopts or deletes what carries its own install id.
   reader and the secret scope go — only after checking all
   of them carry this install's id and hold nothing else (no other UC object, counting ones
   the admin cannot read; no other Lakebase branch or database), so a refusal leaves
-  everything in place. Only the Lakebase project can be recovered, within Lakebase's
-  soft-delete window, and its name stays reserved until then — but the master key goes
-  with the scope, so a recovered project's stored secrets stay unreadable.
+  everything in place. The Lakebase project is purged, so its name is free at once. The
+  reader loses its grants and OAuth secrets before it is deleted; an account that manages
+  the workspace's identities can keep it, with no access, for an account admin to delete.
 
 Cost: a handful of workspace API calls; creating the Lakebase project takes a minute to
 finish in the background. The project scales to zero after five idle minutes.
@@ -70,13 +86,15 @@ finish in the background. The project scales to zero after five idle minutes.
 from __future__ import annotations
 
 import base64
+import html
 import json
 import re
 import secrets
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from databricks.sdk import WorkspaceClient
@@ -96,12 +114,54 @@ TELEMETRY_TABLES = {
     "traces_table": "otel_spans",
 }
 """The Genesis lakehouse schema is ``<app_name>_lakehouse``; Genesis derives the same name."""
-LAKEHOUSE_PRIVILEGES = ("USE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY", "EXTERNAL_USE_SCHEMA")
-"""What the App needs on its lakehouse schema. ``EXTERNAL_USE_SCHEMA`` lets Unity Catalog's
-Iceberg REST endpoint vend storage credentials; ``ALL_PRIVILEGES`` does not include it.
-``USE_CATALOG`` comes with the App's volume binding."""
+LAKEHOUSE_PRIVILEGES = ("USE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY")
+"""What the App always gets on its lakehouse schema; ``USE_CATALOG`` comes with the App's
+volume binding. The lakehouse also needs :data:`EXTERNAL_USE_SCHEMA`, granted on its own."""
+EXTERNAL_USE_SCHEMA = "EXTERNAL_USE_SCHEMA"
+"""Lets Unity Catalog's Iceberg REST endpoint vend storage credentials, which every lakehouse
+read and write needs; ``ALL_PRIVILEGES`` does not include it. Unity Catalog refuses it as
+"not applicable" when the metastore has External data access off (its default) or the schema
+is on Databricks default storage, and a grant that includes it then fails whole."""
+NOT_APPLICABLE = "is not applicable"
+LAKEHOUSE_UNAVAILABLE = (
+    "the Genesis lakehouse is unavailable: Unity Catalog cannot grant the App "
+    "EXTERNAL_USE_SCHEMA on {schema}, so Genesis cannot save tables there (flow outputs that "
+    "name no connection); everything else works. {reason}"
+)
+EXTERNAL_ACCESS_OFF = (
+    "External data access is off on this metastore, Unity Catalog's default: a metastore "
+    "admin turns it on (Catalog -> the metastore's details), then run postinstall again. "
+    "That is enough only when catalog {catalog} is on your own cloud storage: Databricks "
+    "default storage refuses the grant either way."
+)
+DEFAULT_STORAGE = (
+    "External data access is on, so catalog {catalog} is most likely on Databricks default "
+    "storage, which engines outside Databricks cannot use: to use the lakehouse, install with "
+    "a catalog on your own cloud storage."
+)
+EXTERNAL_USE_UNKNOWN = (
+    "Either External data access is off on this metastore (a metastore admin turns it on: "
+    "Catalog -> the metastore's details, then run postinstall again), or catalog {catalog} "
+    "is on Databricks default storage, which engines outside Databricks cannot use; the "
+    "metastore's setting could not be read to tell which."
+)
+EXTERNAL_USE_NOT_GRANTED = (
+    "External data access is on: run postinstall again. If Unity Catalog still refuses the "
+    "grant, catalog {catalog} is on Databricks default storage, which engines outside "
+    "Databricks cannot use, and the lakehouse needs a catalog on your own cloud storage."
+)
 DATA_READER_SUFFIX = "-data-reader"
-"""The data reader is the service principal ``<app_name>-data-reader``."""
+"""The data reader is the service principal ``<app_name>-data-reader-<install id prefix>``;
+earlier versions named it ``<app_name>-data-reader``. It is found by the client id the install
+keeps, whatever its name."""
+READER_ID_CHARS = 8
+"""How much of the install id the reader's name carries: once a reader has had an OAuth
+secret, a workspace on account-managed identities cannot delete it, so a name of its own keeps
+a leftover from blocking the next install."""
+_APPLICATION_ID_RE = re.compile(r"[A-Za-z0-9-]+")
+ACCOUNT_ADMIN_DELETES = (
+    "an account admin can delete it (account console -> User management -> Service principals)"
+)
 DATA_READER_KEY = "data-reader"
 """Key in the App's secret scope holding the reader's ``{"client_id", "client_secret"}``."""
 DATA_READER_SECRET_LIFETIME = f"{730 * 24 * 3600}s"
@@ -126,8 +186,8 @@ _DATA_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,254}")
 _WAREHOUSE_ID_RE = re.compile(r"[A-Za-z0-9]+")
 LAKEBASE_BRANCH = "production"
 LAKEBASE_DATABASE = "databricks-postgres"
-# A Databricks-hosted Claude Sonnet chat endpoint and its version, e.g. ``-5-5``.
-_CLAUDE_SONNET_ENDPOINT = re.compile(r"databricks-claude-sonnet-(\d+(?:-\d+)*)")
+# A Databricks-hosted Claude chat endpoint: its family and version, e.g. ``opus``, ``5-5``.
+_CLAUDE_ENDPOINT = re.compile(r"databricks-claude-([a-z]+)-(\d+(?:-\d+)*)")
 DEFAULT_EMBEDDING_ENDPOINT = "databricks-gte-large-en"
 """The embedding endpoint the bundle binds by default; preinstall names it when it is ready."""
 SQL_WAREHOUSE_USE = (
@@ -155,6 +215,7 @@ _MISSING_HINTS = {
 APP_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,28}[a-z0-9]")
 CATALOG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,254}")
 ACTIONS = (
+    "status",
     "preinstall",
     "postinstall",
     "grant_data",
@@ -164,6 +225,39 @@ ACTIONS = (
     "watchdog",
     "uninstall",
 )
+FORM_ACTIONS = {
+    "status": "Shows what this install has, what is missing, and the next step. Changes nothing.",
+    "preinstall": (
+        "Step 1, before installing the App: creates its schemas, volume, Lakebase project and "
+        "secret scope, then lists what to enter in the install form."
+    ),
+    "postinstall": (
+        "Step 3, after installing the App: checks its settings, lets it write its lakehouse "
+        "schema, and schedules the job that restarts it if it crashes."
+    ),
+    "grant_data": (
+        "Optional: lets Genesis read existing catalogs or schemas with no one signed in "
+        "(scheduled jobs, scans). Leave Confirm empty to see the grants first."
+    ),
+    "revoke_data": "Takes back what grant_data granted on the catalogs or schemas you list.",
+    "rotate_data_reader": "Gives the data reader a new secret and deletes the old ones.",
+    "install_watchdog": "Schedules only the restart job, if postinstall could not.",
+    "uninstall": "Deletes the App. Its data stays unless you also fill in Delete data.",
+}
+"""What the setup form offers, in order, with the help line under the Action field. The
+``watchdog`` action is left out: only the scheduled job runs it."""
+ACTION_FIELDS = {
+    "grant_data": ("data", "confirm"),
+    "revoke_data": ("data", "confirm"),
+    "rotate_data_reader": ("confirm",),
+    "uninstall": ("confirm", "delete_data"),
+}
+"""The fields an action reads besides the App name and catalog; the form shows only these."""
+DRAFTS_FOLDER = "/Drafts/"
+"""Where Databricks can put an imported notebook: a folder people clear out."""
+OK_MARK = "✔"
+MISSING_MARK = "✘"
+OPTIONAL_MARK = "○"
 WATCHDOG_SCHEDULE = "0 0/5 * * * ?"
 """Every five minutes: Databricks never restarts a crashed App, so this bounds the outage."""
 WATCHDOG_TAG = "genesis_install"
@@ -204,8 +298,13 @@ class Install:
         return f"{self.catalog}.{self.lakehouse_schema_name}"
 
     @property
-    def data_reader(self) -> str:
+    def data_reader_prefix(self) -> str:
+        """What every data reader of this App name starts with, this install's or not."""
         return f"{self.app_name}{DATA_READER_SUFFIX}"
+
+    def data_reader_name(self, install_id: str) -> str:
+        """The name this install gives its data reader when grant_data creates it."""
+        return f"{self.data_reader_prefix}-{install_id[:READER_ID_CHARS]}"
 
     @property
     def watchdog_job(self) -> str:
@@ -328,6 +427,13 @@ def _get(call: Any, *args: Any) -> Any:
 
 
 def _project(client: Any, install: Install) -> dict | None:
+    """The install's Lakebase project, or ``None``; a deleted one waiting for its purge is none."""
+    project = _lakebase_project(client, install)
+    return None if project is None or project.get("delete_time") else project
+
+
+def _lakebase_project(client: Any, install: Install) -> dict | None:
+    """The Lakebase project of the install's name, deleted or not."""
     return _get(_api, client, "GET", f"/api/2.0/postgres/{install.project}")
 
 
@@ -367,8 +473,15 @@ def ownership_problems(client: Any, install: Install, install_id: str | None) ->
     volume = _get(client.volumes.read, install.volume)
     if volume is not None and (mark is None or volume.comment != mark):
         problems.append(f"volume {install.volume} exists and is not this install's")
-    project = _project(client, install)
-    if project is not None and (mark is None or _display_name(project) != mark):
+    project = _lakebase_project(client, install)
+    if project is not None and project.get("delete_time"):
+        # A deleted project keeps its name until it is purged; its own owner may still restore it.
+        problems.append(
+            f"Lakebase {install.project} was deleted and keeps its name until "
+            f"{project.get('purge_time')}: choose another App name, or purge it now "
+            f"(databricks postgres delete-project {install.project} --purge)"
+        )
+    elif project is not None and (mark is None or _display_name(project) != mark):
         problems.append(f"Lakebase {install.project} exists and is not this install's")
     keys = _scope_keys(client, install)
     if keys is not None and install_id is None:
@@ -421,14 +534,32 @@ def ready_serving_endpoints(client: Any) -> set[str]:
     }
 
 
-def newest_claude_sonnet(names: set[str]) -> str | None:
-    """The newest Claude Sonnet chat endpoint among ``names``, or None. PURE."""
+def newest_claude(names: set[str], family: str) -> str | None:
+    """The newest Claude chat endpoint of ``family`` (``opus``, ``sonnet``) among ``names``.
+
+    None when there is none. PURE.
+    """
     versions = {
-        name: tuple(int(part) for part in match.group(1).split("-"))
+        name: tuple(int(part) for part in match.group(2).split("-"))
         for name in names
-        if (match := _CLAUDE_SONNET_ENDPOINT.fullmatch(name))
+        if (match := _CLAUDE_ENDPOINT.fullmatch(name)) and match.group(1) == family
     }
     return max(versions, key=versions.__getitem__) if versions else None
+
+
+def _chat_endpoint_line(ready: set[str]) -> str:
+    """The install form's chat-endpoint line: the newest Opus ready, else the newest Sonnet.
+
+    Opus is Genesis's main model on Databricks; Sonnet is named only where no Opus is ready.
+    """
+    if opus := newest_claude(ready, "opus"):
+        return f"chat-endpoint       -> {opus} (the newest Claude Opus ready here), Can query"
+    if sonnet := newest_claude(ready, "sonnet"):
+        return (
+            f"chat-endpoint       -> {sonnet} (no Claude Opus is ready here; the newest "
+            "Claude Sonnet is), Can query"
+        )
+    return "chat-endpoint       -> a chat model serving endpoint, Can query"
 
 
 def suggested_sql_warehouse(client: Any) -> str | None:
@@ -514,10 +645,23 @@ def preinstall(client: Any, install: Install) -> list[str]:
             key=MASTER_KEY,
             string_value=secrets.token_urlsafe(MASTER_KEY_BYTES),
         )
+    mapping = install_form_values(client, install)
+    if generated_key:
+        mapping.append(
+            f"keep a copy of the master key (secret {install.app_name}/{MASTER_KEY}) somewhere "
+            "safe: losing it makes every secret Genesis stores unreadable"
+        )
+    return mapping
+
+
+def install_form_values(client: Any, install: Install) -> list[str]:
+    """What to enter in the install form, field by field, after a header line.
+
+    Cost: two workspace API calls (the serving endpoints and the SQL warehouses).
+    """
     ready = ready_serving_endpoints(client)
-    sonnet = newest_claude_sonnet(ready)
     warehouse = suggested_sql_warehouse(client)
-    mapping = [
+    return [
         "Enter these in the install form:",
         f"App name            -> {install.app_name} (postinstall and uninstall find the App by "
         "this name)",
@@ -525,9 +669,7 @@ def preinstall(client: Any, install: Install) -> list[str]:
         "Can connect and create",
         f"volume              -> {install.volume}, Can read and write",
         f"genesis-master-key  -> secret {install.app_name}/{MASTER_KEY}, Can read",
-        f"chat-endpoint       -> {sonnet} (the newest Claude Sonnet ready here), Can query"
-        if sonnet
-        else "chat-endpoint       -> a chat model serving endpoint, Can query",
+        _chat_endpoint_line(ready),
         f"embedding-endpoint  -> {DEFAULT_EMBEDDING_ENDPOINT}, Can query"
         if DEFAULT_EMBEDDING_ENDPOINT in ready
         else "embedding-endpoint  -> an embedding serving endpoint, Can query",
@@ -536,12 +678,59 @@ def preinstall(client: Any, install: Install) -> list[str]:
         if warehouse
         else f"sql-warehouse       -> a SQL warehouse your users can use, {SQL_WAREHOUSE_USE}",
     ]
-    if generated_key:
-        mapping.append(
-            f"keep a copy of the master key (secret {install.app_name}/{MASTER_KEY}) somewhere "
-            "safe: losing it makes every secret Genesis stores unreadable"
+
+
+def external_access_enabled(client: Any) -> bool:
+    """Whether the metastore has External data access on (off is Unity Catalog's default).
+
+    Cost: one API call.
+    """
+    summary = _api(client, "GET", "/api/2.1/unity-catalog/metastore_summary")
+    return bool(summary.get("external_access_enabled"))
+
+
+def _external_use_reason(client: Any, install: Install, *, refused: bool) -> str:
+    """Why the App lacks :data:`EXTERNAL_USE_SCHEMA`, from the metastore's setting.
+
+    ``refused``: Unity Catalog just refused the grant, rather than it being found missing.
+    A metastore summary that cannot be read gives both possible causes instead of
+    failing: the install is complete either way. Cost: one API call.
+    """
+    try:
+        external_access = external_access_enabled(client)
+    except DatabricksError:
+        return EXTERNAL_USE_UNKNOWN.format(catalog=install.catalog)
+    if not external_access:
+        return EXTERNAL_ACCESS_OFF.format(catalog=install.catalog)
+    if refused:
+        return DEFAULT_STORAGE.format(catalog=install.catalog)
+    return EXTERNAL_USE_NOT_GRANTED.format(catalog=install.catalog)
+
+
+def grant_external_use(client: Any, install: Install, principal: str) -> str | None:
+    """Grant the App :data:`EXTERNAL_USE_SCHEMA` on its lakehouse; ``None`` once granted.
+
+    When Unity Catalog refuses it as not applicable, returns why the lakehouse is unavailable
+    (:data:`LAKEHOUSE_UNAVAILABLE`) instead of raising: the rest of Genesis works without it.
+
+    Cost: one API call, and one more (the metastore summary) on that refusal.
+
+    Raises:
+        DatabricksError: any other refusal.
+    """
+    try:
+        _api(
+            client,
+            "PATCH",
+            f"/api/2.1/unity-catalog/permissions/schema/{install.lakehouse_schema}",
+            body={"changes": [{"principal": principal, "add": [EXTERNAL_USE_SCHEMA]}]},
         )
-    return mapping
+    except DatabricksError as exc:
+        if NOT_APPLICABLE not in f"{exc!s}":
+            raise
+        reason = _external_use_reason(client, install, refused=True)
+        return LAKEHOUSE_UNAVAILABLE.format(schema=install.lakehouse_schema, reason=reason)
+    return None
 
 
 def binding_problems(app: dict, install: Install) -> list[str]:
@@ -591,8 +780,13 @@ def postinstall(client: Any, install: Install, notebook_path: str = "") -> list[
     The watchdog (:func:`install_watchdog`) runs this notebook, so it is scheduled only when
     ``notebook_path`` names it; without one the report says how to schedule it.
 
-    Cost: three API calls (the App, the lakehouse schema, one grant), and with
-    ``notebook_path`` those of :func:`install_watchdog`.
+    Unity Catalog cannot grant :data:`EXTERNAL_USE_SCHEMA` on every metastore and storage;
+    without it the install still completes, and the report says why the lakehouse is
+    unavailable (:func:`grant_external_use`).
+
+    Cost: four API calls (the App, the lakehouse schema, two grants), a fifth (the metastore)
+    when the second grant is refused, and with ``notebook_path`` those of
+    :func:`install_watchdog`.
 
     Raises:
         LifecycleError: listing every binding or setting to fix, or the lakehouse schema
@@ -616,10 +810,14 @@ def postinstall(client: Any, install: Install, notebook_path: str = "") -> list[
         f"/api/2.1/unity-catalog/permissions/schema/{install.lakehouse_schema}",
         body={"changes": [{"principal": principal, "add": list(LAKEHOUSE_PRIVILEGES)}]},
     )
+    unavailable = grant_external_use(client, install, principal)
+    privileges = (
+        LAKEHOUSE_PRIVILEGES if unavailable else (*LAKEHOUSE_PRIVILEGES, EXTERNAL_USE_SCHEMA)
+    )
     state = (app.get("app_status") or {}).get("state", "UNKNOWN")
     report = (
         f"{install.app_name}: {state} at {app.get('url')}; its lakehouse is "
-        f"{install.lakehouse_schema} ({', '.join(LAKEHOUSE_PRIVILEGES)})"
+        f"{install.lakehouse_schema} ({', '.join(privileges)})"
     )
     if app.get("telemetry_export_destinations") == [install.telemetry_destination()]:
         # Configuration only: Databricks applies a telemetry change at the App's next deploy.
@@ -635,13 +833,156 @@ def postinstall(client: Any, install: Install, notebook_path: str = "") -> list[
             "settings, turn on telemetry with logs, metrics and traces tables "
             f"{', '.join(TELEMETRY_TABLES.values())} in that schema, so its logs outlive restarts"
         )
+    notes = [unavailable] if unavailable else []
     if not notebook_path:
         return [
             report,
+            *notes,
             "no watchdog scheduled: run postinstall from the imported notebook, or "
             "install_watchdog there, so a crashed App is restarted",
         ]
-    return [report, install_watchdog(client, install, notebook_path)]
+    lines = [report, *notes, install_watchdog(client, install, notebook_path)]
+    if DRAFTS_FOLDER in notebook_path:
+        # An imported notebook can land in Drafts, which people clear out; the watchdog job
+        # would then fail every five minutes and stop restarting the App.
+        lines.append(
+            "this notebook is in your Drafts folder, and the watchdog job runs it from there: "
+            "move it to a folder you keep (for example your home folder), then run "
+            "install_watchdog from its new place"
+        )
+    return lines
+
+
+def status(client: Any, install: Install) -> list[str]:
+    """What this install has and lacks, one marked line each, then the next step.
+
+    Changes nothing. ``✔`` is there, ``✘`` is missing or wrong, ``○`` is optional and not
+    set up. Cost: about fifteen workspace API calls, two more when the App is not installed
+    (the install form's suggestions).
+    """
+    install.validate()
+    lines: list[str] = []
+
+    def check(ok: bool, text: str) -> bool:
+        lines.append(f"{OK_MARK if ok else MISSING_MARK} {text}")
+        return ok
+
+    try:
+        require_lakebase(client)
+        lakebase = check(True, "Lakebase Postgres is on in this workspace")
+    except LifecycleError:
+        lakebase = check(False, "Lakebase Postgres is on in this workspace")
+    install_id = recorded_install_id(client, install)
+    lakehouse = _get(client.schemas.get, install.lakehouse_schema) is not None
+    created = [
+        check(install_id is not None, f"secret scope {install.app_name} with this install's id"),
+        check(
+            MASTER_KEY in (_scope_keys(client, install) or set()),
+            f"master key {install.app_name}/{MASTER_KEY}",
+        ),
+        check(_get(client.schemas.get, install.schema) is not None, f"schema {install.schema}"),
+        check(_get(client.volumes.read, install.volume) is not None, f"volume {install.volume}"),
+        check(lakehouse, f"lakehouse schema {install.lakehouse_schema}"),
+        check(
+            _get(client.schemas.get, install.telemetry_schema) is not None,
+            f"telemetry schema {install.telemetry_schema}",
+        ),
+    ]
+    if lakebase:
+        created.append(
+            check(_project(client, install) is not None, f"Lakebase project {install.project}")
+        )
+    taken = ownership_problems(client, install, install_id) if lakebase else []
+    lines += [f"{MISSING_MARK} {problem}" for problem in taken]
+    app = _get(_api, client, "GET", f"/api/2.0/apps/{install.app_name}")
+    if app is None:
+        check(False, f"App {install.app_name} is not installed")
+        app_wrong: list[str] = []
+        ready_after_install = False
+    else:
+        app_wrong = app_problems(app, install) or binding_problems(app, install)
+        state = (app.get("app_status") or {}).get("state", "UNKNOWN")
+        check(not app_wrong, f"App {install.app_name}: {state} at {app.get('url')}")
+        lines += [f"{MISSING_MARK} {problem}" for problem in app_wrong]
+        principal = app.get("service_principal_client_id")
+        # A just-uninstalled App is listed until its deletion ends, its schemas already gone.
+        held = (
+            set(_privileges(client, "schema", install.lakehouse_schema, principal))
+            if principal and lakehouse
+            else set()
+        )
+        granted = set(LAKEHOUSE_PRIVILEGES) <= held
+        watched = any(
+            job["settings"].get("tags", {}).get(WATCHDOG_TAG) == install_id
+            for job in _watchdog_jobs(client, install)
+        )
+        ready_after_install = all(
+            (
+                check(granted, f"the App's grants on its lakehouse {install.lakehouse_schema}"),
+                check(watched, f"watchdog job {install.watchdog_job}"),
+            )
+        )
+        if granted and EXTERNAL_USE_SCHEMA not in held:
+            # Not a missing step: the install is complete without it, only its lakehouse
+            # is unavailable, and often only the metastore's admin or a new catalog fixes that.
+            reason = _external_use_reason(client, install, refused=False)
+            lines.append(
+                f"{OPTIONAL_MARK} "
+                + LAKEHOUSE_UNAVAILABLE.format(schema=install.lakehouse_schema, reason=reason)
+            )
+    reader, reader_lines, reader_next = _reader_status(client, install)
+    lines += reader_lines
+    if not lakebase:
+        return [
+            *lines,
+            "Next: turn on Lakebase Postgres (workspace avatar -> Previews), then run preinstall.",
+        ]
+    if taken:
+        return [*lines, "Next: choose another App name; these names are taken."]
+    if not all(created):
+        return [*lines, "Next: run preinstall."]
+    if app is None:
+        values = install_form_values(client, install)[1:]
+        return [*lines, "Next: install the App from the listing with these values:", *values]
+    if app_wrong:
+        return [*lines, "Next: fix the App's settings listed above, then run postinstall."]
+    if not ready_after_install:
+        return [*lines, "Next: run postinstall."]
+    if reader is None:
+        return [*lines, reader_next]
+    return [*lines, "Next: nothing to do; this install is complete."]
+
+
+def _reader_status(client: Any, install: Install) -> tuple[DataReader | None, list[str], str]:
+    """The data reader, its status lines, and the next step when it is the only thing left.
+
+    A reader that cannot be used is a problem to resolve, never "optional": its one line
+    says why, and the next step says to resolve it. Otherwise the lines also name readers
+    earlier installs of this App name left behind, as far as the workspace lists them.
+    Cost: those of :func:`data_reader` (one SCIM lookup and, when the scope keeps a reader,
+    one secret read), and one more SCIM lookup for the leftovers.
+    """
+    try:
+        reader = data_reader(client, install)
+    except LifecycleError as exc:
+        return (
+            None,
+            [f"{MISSING_MARK} {exc!s}"],
+            "Next: resolve the data reader problem listed above.",
+        )
+    leftovers = [
+        f"{OPTIONAL_MARK} service principal {name} is left from an earlier install of "
+        f"{install.app_name}: {ACCOUNT_ADMIN_DELETES}"
+        for name in leftover_readers(client, install, reader)
+    ]
+    if reader is not None:
+        return reader, [f"{OK_MARK} data reader {reader.name}", *leftovers], ""
+    return (
+        None,
+        [f"{OPTIONAL_MARK} data reader (optional: grant_data creates it)", *leftovers],
+        "Next: nothing is required. Optional: run grant_data to let Genesis read your "
+        "existing data with no one signed in.",
+    )
 
 
 @dataclass(frozen=True)
@@ -713,39 +1054,64 @@ class DataReader:
 
     scim_id: str
     application_id: str
+    name: str
 
 
 def data_reader(client: Any, install: Install) -> DataReader | None:
     """The install's data reader, or ``None`` when it has none yet.
 
-    The reader is this install's only when the client id kept in the App's secret scope
-    is its application id. Cost: one SCIM lookup, plus one secret read when the key
-    exists.
+    The reader is the service principal whose application id is the client id kept in the
+    App's secret scope, whatever its name. Cost: one secret read when the key exists, and
+    one SCIM lookup.
 
     Raises:
-        LifecycleError: a service principal of the reader's name exists that is not this
-            install's.
+        LifecycleError: the kept record is malformed, or no reader is kept and a service
+            principal of this install's reader name exists (not this install's).
     """
-    found = (
-        _api(
-            client,
-            "GET",
-            SCIM_SERVICE_PRINCIPALS,
-            query={"filter": f'displayName eq "{install.data_reader}"'},
-        ).get("Resources")
+    stored = _stored_reader(client, install).get("client_id")
+    if stored:
+        if not _APPLICATION_ID_RE.fullmatch(str(stored)):
+            raise LifecycleError(
+                f"secret {install.app_name}/{DATA_READER_KEY} keeps a client id that is not "
+                "one; nothing was changed"
+            )
+        found = _service_principals(client, f'applicationId eq "{stored}"')
+        if found:
+            return DataReader(found[0]["id"], found[0]["applicationId"], found[0]["displayName"])
+        return None
+    install_id = recorded_install_id(client, install)
+    if install_id is None:
+        return None
+    name = install.data_reader_name(install_id)
+    if _service_principals(client, f'displayName eq "{name}"'):
+        raise LifecycleError(
+            f"service principal {name} exists and is not this install's (its client id is "
+            f"not the one in secret scope {install.app_name}): delete it or choose another "
+            "app_name"
+        )
+    return None
+
+
+def _service_principals(client: Any, scim_filter: str) -> list[dict]:
+    """The workspace's service principals matching a SCIM filter; one API call."""
+    return (
+        _api(client, "GET", SCIM_SERVICE_PRINCIPALS, query={"filter": scim_filter}).get("Resources")
         or []
     )
-    if not found:
-        return None
-    stored = _stored_reader(client, install).get("client_id")
-    ours = [entry for entry in found if entry.get("applicationId") == stored]
-    if not ours:
-        raise LifecycleError(
-            f"service principal {install.data_reader} exists and is not this install's (its "
-            f"client id is not the one in secret scope {install.app_name}): delete it or "
-            "choose another app_name"
+
+
+def leftover_readers(client: Any, install: Install, reader: DataReader | None) -> list[str]:
+    """Names of data readers of this App name that are not this install's; one API call."""
+    mine = reader.application_id if reader else None
+    return sorted(
+        entry["displayName"]
+        for entry in _service_principals(client, f'displayName sw "{install.data_reader_prefix}"')
+        if entry.get("applicationId") != mine
+        and re.fullmatch(
+            rf"{re.escape(install.data_reader_prefix)}(-[0-9a-f]{{{READER_ID_CHARS}}})?",
+            entry["displayName"],
         )
-    return DataReader(ours[0]["id"], ours[0]["applicationId"])
+    )
 
 
 def _stored_reader(client: Any, install: Install) -> dict:
@@ -778,7 +1144,7 @@ def _keep_reader(client: Any, install: Install, reader: DataReader, client_secre
     )
 
 
-def _create_data_reader(client: Any, install: Install) -> DataReader:
+def _create_data_reader(client: Any, install: Install, name: str) -> DataReader:
     """Create the data reader with an OAuth secret kept in the App's scope. Four API calls.
 
     It is given no access to the App's secret scope, so SQL run as it cannot read the App's
@@ -789,9 +1155,9 @@ def _create_data_reader(client: Any, install: Install) -> DataReader:
         client,
         "POST",
         SCIM_SERVICE_PRINCIPALS,
-        body={"schemas": [SCIM_SERVICE_PRINCIPAL_SCHEMA], "displayName": install.data_reader},
+        body={"schemas": [SCIM_SERVICE_PRINCIPAL_SCHEMA], "displayName": name},
     )
-    reader = DataReader(created["id"], created["applicationId"])
+    reader = DataReader(created["id"], created["applicationId"], name)
     _keep_reader(client, install, reader, "")
     _new_reader_secret(client, install, reader, just_created=True)
     return reader
@@ -860,19 +1226,25 @@ def grant_data_access(client: Any, install: Install, data: str, confirm: str) ->
     grants = data_grants(data)
     warehouse = _bound_warehouse(_api(client, "GET", f"/api/2.0/apps/{install.app_name}"))
     _require_securables(client, grants)
+    install_id = recorded_install_id(client, install)
+    if install_id is None:
+        raise LifecycleError(
+            f"secret scope {install.app_name} has no install id: run preinstall first"
+        )
     reader = data_reader(client, install)
+    name = reader.name if reader else install.data_reader_name(install_id)
     # Unity Catalog names a service principal by its application id, known once created.
-    principal = reader.application_id if reader else f"<application id of {install.data_reader}>"
+    principal = reader.application_id if reader else f"<application id of {name}>"
     setup = (
         []
         if reader
         else [
-            f"create service principal {install.data_reader}, with no access to the App's "
+            f"create service principal {name}, with no access to the App's "
             f"secret scope, and keep its OAuth secret in that scope, {install.app_name} "
             f"({DATA_READER_KEY})"
         ]
     )
-    setup.append(f"let {install.data_reader} use SQL warehouse {warehouse}")
+    setup.append(f"let {name} use SQL warehouse {warehouse}")
     statements = [item.statement("GRANT", principal) for item in grants]
     reach = [*_browse_reach(grants), DATA_GRANTS_REACH]
     if confirm != install.app_name:
@@ -883,7 +1255,7 @@ def grant_data_access(client: Any, install: Install, data: str, confirm: str) ->
             *reach,
         ]
     if reader is None:
-        reader = _create_data_reader(client, install)
+        reader = _create_data_reader(client, install, name)
         statements = [item.statement("GRANT", reader.application_id) for item in grants]
     elif not _stored_reader(client, install).get("client_secret"):
         # A run that stopped after creating the reader, before its secret was kept; it may
@@ -901,7 +1273,7 @@ def grant_data_access(client: Any, install: Install, data: str, confirm: str) ->
     )
     _change_grants(client, grants, reader.application_id, "add")
     return [
-        f"Data reader {install.data_reader} ({reader.application_id}) can use SQL warehouse "
+        f"Data reader {reader.name} ({reader.application_id}) can use SQL warehouse "
         f"{warehouse}. Granted:",
         *statements,
         *reach,
@@ -929,15 +1301,13 @@ def revoke_data_access(client: Any, install: Install, data: str, confirm: str) -
     names = _data_names(data)
     reader = data_reader(client, install)
     if reader is None:
-        raise LifecycleError(
-            f"this install has no data reader ({install.data_reader}): nothing to revoke"
-        )
+        raise LifecycleError("this install has no data reader: nothing to revoke")
     named = [DataGrant("schema" if "." in name else "catalog", name, ()) for name in names]
     _require_securables(client, named)
     revokes = _held_by_reader(client, names, reader.application_id)
     statements = [item.statement("REVOKE", reader.application_id) for item in revokes]
     if not statements:
-        return [f"{install.data_reader} holds nothing on {', '.join(names)}: nothing to revoke"]
+        return [f"{reader.name} holds nothing on {', '.join(names)}: nothing to revoke"]
     if confirm != install.app_name:
         return [
             f"Dry run: nothing was revoked. Set confirm to {install.app_name} to run:",
@@ -1019,14 +1389,12 @@ def rotate_data_reader(client: Any, install: Install, confirm: str) -> str:
     install.validate()
     reader = data_reader(client, install)
     if reader is None:
-        raise LifecycleError(
-            f"this install has no data reader ({install.data_reader}): run grant_data first"
-        )
+        raise LifecycleError("this install has no data reader: run grant_data first")
     if confirm != install.app_name:
         raise LifecycleError(f"confirm must be exactly the App name {install.app_name!r}")
     deleted = _new_reader_secret(client, install, reader)
     return (
-        f"{install.data_reader} has a new OAuth secret in secret scope {install.app_name}; "
+        f"{reader.name} has a new OAuth secret in secret scope {install.app_name}; "
         f"deleted {deleted} older secret(s)"
     )
 
@@ -1219,7 +1587,10 @@ def watchdog(client: Any, install: Install, now: datetime) -> str:
             f"{install.app_name} crashed and its deployment's age is unknown: not redeploying "
             "what may be a release that keeps crashing; read the App's logs"
         )
-    if now - datetime.fromisoformat(deployed) < CRASH_LOOP_WINDOW:
+    # Python 3.10, which serverless jobs run, cannot parse the trailing Z the Apps API
+    # returns; without this the watchdog would fail on every crashed App.
+    deployed_at = datetime.fromisoformat(deployed.replace("Z", "+00:00"))  # noqa: FURB162 -- 3.10
+    if now - deployed_at < CRASH_LOOP_WINDOW:
         raise LifecycleError(
             f"{install.app_name} crashed within {CRASH_LOOP_WINDOW.seconds // 60} minutes of "
             f"its deployment ({deployed}): not redeploying a release that keeps crashing; "
@@ -1347,25 +1718,94 @@ def uninstall(
         problems += data_problems(client, install)
     if problems:
         raise LifecycleError("refusing to uninstall: " + "; ".join(problems))
-    # Looked up before anything is deleted: a reader that is not this install's refuses.
+    # Looked up before anything is deleted: a reader that is not this install's refuses,
+    # and so does a grant of the reader's that no revoke could name.
     reader = data_reader(client, install) if delete_data else None
+    reader_grants = _reader_grants(client, reader) if reader else []
     install_id = recorded_install_id(client, install)
+    if app is not None:
+        # First: Databricks refuses to delete an App that is still starting, and nothing
+        # else may be gone by then.
+        try:
+            _api(client, "DELETE", f"/api/2.0/apps/{install.app_name}")
+        except BadRequest as exc:
+            raise LifecycleError(f"{exc!s} nothing was deleted; run uninstall again then") from exc
+        report(f"deleted app {install.app_name}")
     for job in _watchdog_jobs(client, install):
         # Only the job tagged with this install's id: another of that name is not ours.
         if install_id and job["settings"].get("tags", {}).get(WATCHDOG_TAG) == install_id:
             _api(client, "POST", "/api/2.2/jobs/delete", body={"job_id": job["job_id"]})
             report(f"deleted watchdog job {install.watchdog_job}")
-    if app is not None:
-        _api(client, "DELETE", f"/api/2.0/apps/{install.app_name}")
-        report(f"deleted app {install.app_name}")
     if delete_data:
-        _delete_data(client, install, reader, report)
+        # The reader goes first: its grants can name this install's own schemas, which go
+        # next, and a revoke on a deleted schema fails.
+        if reader is not None:
+            _delete_reader(client, reader, reader_grants, report)
+        elif orphan := _stored_reader(client, install).get("client_id"):
+            # The scope about to be deleted is its only record.
+            report(
+                f"no service principal with the data reader's client id {orphan} is listed in "
+                f"this workspace: if it still exists, {ACCOUNT_ADMIN_DELETES}"
+            )
+        _delete_data(client, install, report)
 
 
-def _delete_data(client: Any, install: Install, reader: DataReader | None, report: Report) -> None:
+def _reader_grants(client: Any, reader: DataReader) -> list[DataGrant]:
+    """What the reader holds on each catalog where it holds something, and its schemas.
+
+    grant_data gives a catalog's ``USE CATALOG`` with any schema in it, so these are all
+    the grants grant_data made. A schema grant made by hand in a catalog where the reader
+    holds nothing is not found: finding it would mean reading every schema of the
+    metastore, and the reader has no OAuth secret left to use it after uninstall. System catalogs take
+    no grants and are skipped. Cost: one API call per page of catalogs and one per catalog,
+    then for each reached catalog one per page of its schemas and one per schema.
+
+    Raises:
+        LifecycleError: a reached catalog lists a schema no revoke can name.
+    """
+    catalogs = _list_names(
+        client, "/api/2.1/unity-catalog/catalogs", {"include_browse": "true"}, "catalogs"
+    )
+    reached = [
+        catalog
+        for catalog in catalogs
+        if catalog not in HIDDEN_CATALOGS
+        and _privileges(client, "catalog", catalog, reader.application_id)
+    ]
+    return _held_by_reader(client, reached, reader.application_id)
+
+
+def _delete_reader(
+    client: Any, reader: DataReader, grants: list[DataGrant], report: Report
+) -> None:
+    """Take the reader's grants and OAuth secrets away, then delete it from the workspace.
+
+    Cost: one API call per securable in ``grants``, one to list the OAuth secrets and one
+    per secret to delete it, and one to delete the principal.
+    """
+    _change_grants(client, grants, reader.application_id, "remove")
+    path = f"{SERVICE_PRINCIPAL_SECRETS}/{reader.scim_id}/credentials/secrets"
+    secrets = [entry["id"] for entry in _api(client, "GET", path).get("secrets") or []]
+    for secret_id in secrets:
+        _api(client, "DELETE", f"{path}/{secret_id}")
+    _api(client, "DELETE", f"{SCIM_SERVICE_PRINCIPALS}/{reader.scim_id}")
+    report(
+        f"deleted data reader {reader.name}, after revoking its grants on {len(grants)} "
+        f"securable(s) and deleting its {len(secrets)} OAuth secret(s)"
+    )
+    # The workspace cannot tell: once a principal has had an OAuth secret, an account that
+    # manages the workspace's identities keeps it after the workspace deletes it.
+    report(
+        f"{reader.name} can stay in your Databricks account, which manages this workspace's "
+        f"identities, with no access left: {ACCOUNT_ADMIN_DELETES}"
+    )
+
+
+def _delete_data(client: Any, install: Install, report: Report) -> None:
     """Delete the install's data, after uninstall has checked it is only this install's."""
     if _project(client, install) is not None:
-        _api(client, "DELETE", f"/api/2.0/postgres/{install.project}")
+        # Purged: a deleted project keeps its name for days, and preinstall needs it again.
+        _api(client, "DELETE", f"/api/2.0/postgres/{install.project}", query={"purge": "true"})
         report(f"deleted Lakebase project {install.project}")
     if _get(client.volumes.read, install.volume) is not None:
         client.volumes.delete(install.volume)
@@ -1384,9 +1824,6 @@ def _delete_data(client: Any, install: Install, reader: DataReader | None, repor
         )
         named = f": {', '.join(tables)}" if tables else ""
         report(f"deleted {holds} schema {full_name} with its {len(tables)} tables{named}")
-    if reader is not None:
-        _api(client, "DELETE", f"{SCIM_SERVICE_PRINCIPALS}/{reader.scim_id}")
-        report(f"deleted data reader {install.data_reader}")
     if _scope_keys(client, install) is not None:
         client.secrets.delete_scope(scope=install.app_name)
         report(f"deleted secret scope {install.app_name} (with the master key)")
@@ -1406,6 +1843,9 @@ def run(
 ) -> None:
     """Run one lifecycle action, reporting each line to the admin as it happens."""
     match action:
+        case "status":
+            for line in status(client, install):
+                report(line)
         case "preinstall":
             for line in preinstall(client, install):
                 report(line)
@@ -1423,36 +1863,247 @@ def run(
         case "install_watchdog":
             report(install_watchdog(client, install, notebook_path))
         case "watchdog":
-            report(watchdog(client, install, now or datetime.now(UTC)))
+            report(watchdog(client, install, now or datetime.now(timezone.utc)))
         case "uninstall":
             uninstall(client, install, confirm, delete_data, report)
         case _:
             raise LifecycleError(f"action must be one of {', '.join(ACTIONS)}, not {action!r}")
 
 
+def job_parameter(notebook_utils: Any, name: str) -> str:
+    """A job run's parameter ``name``, stripped, or ``""`` when the run has none of that name.
+
+    A job's parameters are readable without defining a field for them; reading one the run
+    was not given raises a runtime-specific error (not a Python type to catch by name).
+    """
+    try:
+        return str(notebook_utils.widgets.get(name)).strip()
+    # py4j raises its own error types for a field the run was not given.
+    except Exception:
+        return ""
+
+
+def running_as_job(notebook_utils: Any) -> bool:
+    """Whether this notebook runs as a job (the watchdog's), not opened by a person."""
+    context = notebook_utils.notebook.entry_point.getDbutils().notebook().getContext()
+    return bool(context.jobId().isDefined())
+
+
+def form_client(client: Any) -> WorkspaceClient:
+    """A client for the setup form's button, holding the token ``client`` has right now.
+
+    Call it while a cell runs. Notebook auth asks the running cell for its token on every
+    request, and a button callback runs after the cell has ended, so ``client`` itself fails
+    there with "Missing api_token from command execution".
+    """
+    token = client.config.authenticate()["Authorization"].removeprefix("Bearer ")
+    return WorkspaceClient(host=client.config.host, token=token, auth_type="pat")
+
+
+def result_html(action: str, lines: list[str], error: str = "") -> str:
+    """The form's result box for ``action``: one line per report line, the error last. PURE.
+
+    Lines marked ``✔`` / ``✘`` / ``○`` are coloured, ``Next:`` is set in bold; everything is
+    escaped, since names come from the workspace.
+    """
+    rows = []
+    for line in lines:
+        text = html.escape(line)
+        if line.startswith(OK_MARK):
+            rows.append(f"<div class='gs-ok-line'>{text}</div>")
+        elif line.startswith(MISSING_MARK):
+            rows.append(f"<div class='gs-bad-line'>{text}</div>")
+        elif line.startswith("Next:"):
+            rows.append(f"<div class='gs-next'><b>Next:</b>{text.removeprefix('Next:')}</div>")
+        else:
+            rows.append(f"<div>{text}</div>")
+    if error:
+        title = f"{html.escape(action)} stopped"
+        rows.append(f"<div class='gs-err-text'>{html.escape(error)}</div>")
+        return f"<div class='gs-err'><div class='gs-head'>✘ {title}</div>{''.join(rows)}</div>"
+    title = f"{html.escape(action)} finished"
+    return f"<div class='gs-done'><div class='gs-head'>✔ {title}</div>{''.join(rows)}</div>"
+
+
+FORM_CSS = """<style>
+.gs-card{border:1px solid #d0d7de;border-radius:12px;padding:20px 24px;max-width:720px;
+  box-shadow:0 6px 24px rgba(0,0,0,.12);background:#fff;color:#1f2328;font-family:system-ui,sans-serif}
+.gs-title{font-size:20px;font-weight:600;margin:0 0 4px}
+.gs-sub{color:#57606a;margin:0 0 14px;font-size:13px}
+.gs-help{color:#57606a;font-size:12px;margin:-2px 0 10px 130px}
+.gs-run button, button.gs-run{font-size:15px !important;font-weight:600 !important;height:40px !important}
+.gs-done,.gs-err,.gs-busy{border-radius:8px;padding:10px 12px;margin-top:12px;font-size:13px;line-height:1.5;
+  white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace}
+.gs-done{background:#f0f8f2;border:1px solid #2e7d32}
+.gs-err{background:#fdecea;border:1px solid #c62828}
+.gs-busy{background:#f3f4f6;border:1px solid #d0d7de}
+.gs-head{font-family:system-ui,sans-serif;font-weight:600;font-size:14px;margin-bottom:6px}
+.gs-ok-line{color:#1a7f37}.gs-bad-line{color:#c62828}
+.gs-next{margin-top:8px;font-family:system-ui,sans-serif}
+.gs-err-text{margin-top:6px;color:#8b1a1a}
+</style>"""
+FIELD_HELP = {
+    "app_name": "The Databricks App's name. Keep genesis unless you install Genesis twice.",
+    "catalog": "Where Genesis keeps its schemas and volume. Listed from this workspace.",
+    "data": "Catalogs, or catalog.schema names, comma-separated, e.g. sales, finance.reports",
+    "confirm": "Type the App name to go ahead.",
+    "delete_data": "Leave empty to keep the data. To delete it too, type: delete <App name> data",
+}
+"""The help line under each field of the setup form."""
+HIDDEN_CATALOGS = frozenset({"system", "samples", "__databricks_internal"})
+
+
+def show_form(client: Any, default_catalog: str, notebook_path: str) -> None:
+    """Show the setup form in the notebook's output; its button runs the chosen action.
+
+    Notebook only: draws with ipywidgets, which the Databricks notebook runtime provides.
+    Cost: one catalog listing to fill the Catalog field; the action's own cost on each run.
+    """
+    import ipywidgets as fields  # noqa: PLC0415 -- notebook runtime only, absent elsewhere
+    from IPython.display import display  # noqa: PLC0415 -- notebook runtime only
+
+    style = {"description_width": "120px"}
+
+    def wide() -> Any:
+        # One Layout per field: a shared one would hide every field with the one hidden.
+        return fields.Layout(width="100%")
+
+    def help_line(text: str) -> Any:
+        return fields.HTML(f"<div class='gs-help'>{html.escape(text)}</div>")
+
+    try:
+        catalogs = sorted(
+            entry.name for entry in client.catalogs.list() if entry.name not in HIDDEN_CATALOGS
+        )
+    except DatabricksError:
+        catalogs = []
+    action = fields.Dropdown(
+        options=list(FORM_ACTIONS),
+        value="status",
+        description="Action",
+        style=style,
+        layout=wide(),
+    )
+    action_help = fields.HTML()
+    app_name = fields.Text(value="genesis", description="App name", style=style, layout=wide())
+    if default_catalog in catalogs:
+        catalog = fields.Dropdown(
+            options=catalogs,
+            value=default_catalog,
+            description="Catalog",
+            style=style,
+            layout=wide(),
+        )
+    else:
+        catalog = fields.Text(
+            value=default_catalog, description="Catalog", style=style, layout=wide()
+        )
+    extra = {
+        "data": fields.Text(description="Data", style=style, layout=wide()),
+        "confirm": fields.Text(description="Confirm", style=style, layout=wide()),
+        "delete_data": fields.Text(description="Delete data", style=style, layout=wide()),
+    }
+    extra_help = {name: help_line(FIELD_HELP[name]) for name in extra}
+    button = fields.Button(button_style="primary", icon="play", layout=fields.Layout(width="260px"))
+    button.add_class("gs-run")
+    result = fields.HTML()
+
+    def refresh(*_: Any) -> None:
+        chosen = action.value
+        action_help.value = f"<div class='gs-help'>{html.escape(FORM_ACTIONS[chosen])}</div>"
+        for name, field in extra.items():
+            shown = "" if name in ACTION_FIELDS.get(chosen, ()) else "none"
+            field.layout.display = shown
+            extra_help[name].layout.display = shown
+        button.description = f"Run {chosen}"
+
+    def on_run(_: Any) -> None:
+        chosen = action.value
+        lines: list[str] = []
+        button.disabled = True
+        button.description = "Running…"
+        result.value = "<div class='gs-busy'>Working… some steps take a minute.</div>"
+
+        def report(line: str) -> None:
+            lines.append(line)
+            result.value = f"<div class='gs-busy'>{html.escape(chr(10).join(lines))}</div>"
+
+        try:
+            run(
+                client,
+                chosen,
+                Install(app_name.value.strip(), str(catalog.value or "").strip()),
+                extra["confirm"].value.strip(),
+                extra["delete_data"].value.strip(),
+                report,
+                notebook_path=notebook_path,
+                data=extra["data"].value.strip(),
+            )
+            result.value = result_html(chosen, lines)
+        except LifecycleError as exc:
+            result.value = result_html(chosen, lines, error=str(exc))
+        # Anything else is shown in the form too: a button callback has no other output.
+        except Exception as exc:
+            details = html.escape(traceback.format_exc())
+            result.value = result_html(chosen, lines, error=f"{type(exc).__name__}: {exc!s}") + (
+                f"<details><summary>Details for support</summary><pre>{details}</pre></details>"
+            )
+        finally:
+            button.disabled = False
+            refresh()
+
+    action.observe(refresh, names="value")
+    button.on_click(on_run)
+    refresh()
+    rows = [
+        fields.HTML(
+            FORM_CSS + "<div class='gs-title'>Genesis setup</div><div class='gs-sub'>Pick what to "
+            "do, check the values, then press the button. The defaults fit most installs.</div>"
+        ),
+        action,
+        action_help,
+        app_name,
+        help_line(FIELD_HELP["app_name"]),
+        catalog,
+        help_line(FIELD_HELP["catalog"]),
+    ]
+    for name, field in extra.items():
+        rows += [field, extra_help[name]]
+    card = fields.VBox([*rows, button, result])
+    card.add_class("gs-card")
+    display(card)
+
+
 # COMMAND ----------
 
 if __name__ == "__main__" and "dbutils" in globals():
-    widgets = dbutils.widgets  # noqa: F821 -- provided by the notebook runtime
-    widgets.dropdown("action", "postinstall", list(ACTIONS))
-    # The defaults the install form's help text names: App name genesis, and the
-    # workspace's default catalog.
-    widgets.text("app_name", "genesis")
-    widgets.text("catalog", spark.catalog.currentCatalog())  # noqa: F821 -- notebook runtime
-    widgets.text("confirm", "")
-    widgets.text("delete_data", "")
-    # grant_data / revoke_data: catalogs or catalog.schema names, comma-separated.
-    widgets.text("data", "")
-    run(
-        WorkspaceClient(),
-        widgets.get("action"),
-        Install(widgets.get("app_name").strip(), widgets.get("catalog").strip()),
-        widgets.get("confirm").strip(),
-        widgets.get("delete_data").strip(),
-        notebook_path=dbutils.notebook.entry_point.getDbutils()  # noqa: F821 -- notebook runtime
+    notebook_utils = dbutils  # noqa: F821 -- provided by the notebook runtime
+    this_notebook = (
+        notebook_utils.notebook.entry_point.getDbutils()
         .notebook()
         .getContext()
         .notebookPath()
-        .get(),
-        data=widgets.get("data").strip(),
+        .get()
     )
+    if running_as_job(notebook_utils):
+        # The watchdog job, or anyone running this notebook as a job with parameters.
+        run(
+            WorkspaceClient(),
+            job_parameter(notebook_utils, "action"),
+            Install(
+                job_parameter(notebook_utils, "app_name"), job_parameter(notebook_utils, "catalog")
+            ),
+            job_parameter(notebook_utils, "confirm"),
+            job_parameter(notebook_utils, "delete_data"),
+            notebook_path=this_notebook,
+            data=job_parameter(notebook_utils, "data"),
+        )
+    else:
+        # Fields an earlier version of this notebook defined would sit above the form and
+        # read as the way to run it; the form replaces them.
+        notebook_utils.widgets.removeAll()
+        show_form(
+            form_client(WorkspaceClient()),
+            spark.catalog.currentCatalog(),  # noqa: F821 -- provided by the notebook runtime
+            this_notebook,
+        )
