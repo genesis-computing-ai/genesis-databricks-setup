@@ -15,8 +15,11 @@ an account admin adds these domains to it under Allowed domains before you insta
 waits about ten minutes for the change to take effect: `github.com`,
 `release-assets.githubusercontent.com`, `objects.githubusercontent.com`, `pypi.org` and
 `files.pythonhosted.org`. Without them the install's build fails, and the App's build log
-names the domain it could not reach. Connections you add later to hosts outside Databricks
-need those hosts allowed too; the App's Test Connection names each one.
+names the domain it could not reach. A connection you add later to a public host outside
+Databricks needs that host allowed too; when Test Connection finds the connection blocked, it
+names the hosts to allow. A connection routed through a Genesis Outpost needs no allowed
+domain, and a private or on-premises host cannot be reached through Allowed domains at all:
+it needs a private connection from the workspace or an Outpost.
 
 ## Install Genesis in three steps
 
