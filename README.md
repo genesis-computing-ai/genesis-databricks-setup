@@ -3,8 +3,7 @@
 `genesis_lifecycle.py` prepares a Databricks workspace for the Genesis App from the Databricks
 Marketplace, checks it after installing, and removes it.
 
-This is the notebook of the Genesis **1.20.2** release candidate (built from genesis-agents
-`f7765a271b`).
+This is the notebook of Genesis **1.20.3** (built from genesis-agents `15b7c07190f2a015c23fd7881592a8f1a5420dbf`).
 `main` holds the newest release published here.
 
 ## If your workspace restricts serverless egress
@@ -27,8 +26,9 @@ it needs a private connection from the workspace or an Outpost.
 
    https://raw.githubusercontent.com/genesis-computing-ai/genesis-databricks-setup/main/genesis_lifecycle.py
 
-   Run it with `action` set to `preinstall`. It creates the Lakebase database, a Unity Catalog
-   schema and volume and a secret scope, then prints what to enter in each install field.
+   (or `https://raw.githubusercontent.com/genesis-computing-ai/genesis-databricks-setup/v1.20.3/genesis_lifecycle.py` for exactly this release). Run it with `action`
+   set to `preinstall`. It creates the Lakebase database, a Unity Catalog schema and volume
+   and a secret scope, then prints what to enter in each install field.
 2. **Install** Genesis from its Databricks Marketplace listing, entering the values the
    notebook printed.
 3. **Finish.** Run the notebook again with `action` set to `postinstall`.
