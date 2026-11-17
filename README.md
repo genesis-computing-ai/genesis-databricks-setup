@@ -29,7 +29,8 @@ Allow that domain too, or download the notebook and import it as a file.
 
    - **Git folder (recommended).** Workspace -> Create -> Git folder, with
      `https://github.com/genesis-computing-ai/genesis-databricks-setup` as the repository URL, then open `genesis_lifecycle` in the
-     new folder. Nothing is uploaded, and pulling the folder later brings in a newer release.
+     new folder. Nothing is uploaded. Pull only when upgrading Genesis, then run `postinstall`
+     again; the restart job runs this notebook as it is in the folder.
    - **Import from a URL.** Open Workspace -> Users -> your email, then use that folder's ⋮
      menu -> Import -> URL, and paste
 
