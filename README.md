@@ -20,18 +20,45 @@ names the hosts to allow. A connection routed through a Genesis Outpost needs no
 domain, and a private or on-premises host cannot be reached through Allowed domains at all:
 it needs a private connection from the workspace or an Outpost.
 
+Importing this notebook by URL (step 1 below) fetches it from `raw.githubusercontent.com`.
+Allow that domain too, or download the notebook and import it as a file.
+
 ## Install Genesis in three steps
 
-1. **Prepare.** In your workspace: Workspace -> Import -> URL, and paste
+1. **Prepare.** Bring the notebook into your workspace in one of these ways:
 
-   https://raw.githubusercontent.com/genesis-computing-ai/genesis-databricks-setup/main/genesis_lifecycle.py
+   - **Git folder (recommended).** Workspace -> Create -> Git folder, with
+     `https://github.com/genesis-computing-ai/genesis-databricks-setup` as the repository URL, then open `genesis_lifecycle` in the
+     new folder. Nothing is uploaded. Pull only when upgrading Genesis, then run `postinstall`
+     again; the restart job runs this notebook as it is in the folder.
+   - **Import from a URL.** Open Workspace -> Users -> your email, then use that folder's ⋮
+     menu -> Import -> URL, and paste
 
-   (or `https://raw.githubusercontent.com/genesis-computing-ai/genesis-databricks-setup/v1.20.3/genesis_lifecycle.py` for exactly this release). Run it with `action`
-   set to `preinstall`. It creates the Lakebase database, a Unity Catalog schema and volume
-   and a secret scope, then prints what to enter in each install field.
+     https://raw.githubusercontent.com/genesis-computing-ai/genesis-databricks-setup/main/genesis_lifecycle.py
+
+     (or `https://raw.githubusercontent.com/genesis-computing-ai/genesis-databricks-setup/v1.20.3/genesis_lifecycle.py` for exactly this release). If Import -> URL fails (a
+     workspace with restricted egress), download `genesis_lifecycle.py` from that address and use
+     Import -> File from the same folder menu instead.
+   - **Databricks CLI.** From a copy of this repository, with your own email in the path:
+
+     ```
+     databricks workspace import /Users/<your email>/genesis_lifecycle --file genesis_lifecycle.py --format SOURCE --language PYTHON
+     ```
+
+   Run it with `action` set to `preinstall`. It creates the Lakebase database, a Unity
+   Catalog schema and volume and a secret scope, then prints what to enter in each install
+   field.
 2. **Install** Genesis from its Databricks Marketplace listing, entering the values the
    notebook printed.
 3. **Finish.** Run the notebook again with `action` set to `postinstall`.
+
+## Troubleshooting
+
+**`File upload failed with error: requirement failed: undefined/genesis_lifecycle is not absolute`.**
+The Import dialog was opened without a target folder (from the workspace home page, Recents,
+or the top-level New -> Import), so Databricks had no folder to put the notebook in. The file
+is fine. Open a folder first, such as Workspace -> Users -> your email, and import from that
+folder's ⋮ menu, or use the Git folder or the Databricks CLI (step 1).
 
 The full guide, including granting Genesis your existing data and uninstalling:
 https://docs.genesiscomputing.com/docs/deployments/Databricks/Genesis-On-Databricks#marketplace-install-and-removal
