@@ -22,16 +22,40 @@ it needs a private connection from the workspace or an Outpost.
 
 ## Install Genesis in three steps
 
-1. **Prepare.** In your workspace: Workspace -> Import -> URL, and paste
-
-   https://raw.githubusercontent.com/genesis-computing-ai/genesis-databricks-setup/main/genesis_lifecycle.py
-
-   (or `https://raw.githubusercontent.com/genesis-computing-ai/genesis-databricks-setup/v1.20.3/genesis_lifecycle.py` for exactly this release). Run it with `action`
-   set to `preinstall`. It creates the Lakebase database, a Unity Catalog schema and volume
-   and a secret scope, then prints what to enter in each install field.
+1. **Prepare.** Bring the notebook into your workspace (a Git folder is easiest; see
+   [Getting the notebook into your workspace](#getting-the-notebook-into-your-workspace)), then
+   run it with `action` set to `preinstall`. It creates the Lakebase database, a Unity Catalog
+   schema and volume and a secret scope, then prints what to enter in each install field.
 2. **Install** Genesis from its Databricks Marketplace listing, entering the values the
    notebook printed.
 3. **Finish.** Run the notebook again with `action` set to `postinstall`.
+
+## Getting the notebook into your workspace
+
+- **Git folder (recommended).** In your workspace: Workspace -> Create -> Git folder, and enter
+  `https://github.com/genesis-computing-ai/genesis-databricks-setup` as the repository URL.
+  Open `genesis_lifecycle` in the new folder. Nothing is uploaded, and pulling the folder later
+  brings in a newer release.
+- **Import from a URL.** Open Workspace -> Users -> your email, then use that folder's ⋮ menu
+  -> Import -> URL, and paste
+
+  https://raw.githubusercontent.com/genesis-computing-ai/genesis-databricks-setup/main/genesis_lifecycle.py
+
+  (or `https://raw.githubusercontent.com/genesis-computing-ai/genesis-databricks-setup/v1.20.3/genesis_lifecycle.py`
+  for exactly this release).
+- **Databricks CLI.** From a copy of this repository, with your own email in the path:
+
+  ```
+  databricks workspace import /Users/<your email>/genesis_lifecycle --file genesis_lifecycle.py --format SOURCE --language PYTHON
+  ```
+
+## Troubleshooting
+
+**`File upload failed with error: requirement failed: undefined/genesis_lifecycle is not absolute`.**
+The Import dialog was opened without a target folder (from the workspace home page, Recents,
+or the top-level New -> Import), so Databricks had no folder to put the notebook in. The file
+is fine. Open a folder first, such as Workspace -> Users -> your email, and import from that
+folder's ⋮ menu, or use any of the three ways above.
 
 The full guide, including granting Genesis your existing data and uninstalling:
 https://docs.genesiscomputing.com/docs/deployments/Databricks/Genesis-On-Databricks#marketplace-install-and-removal
