@@ -255,6 +255,13 @@ ACTION_FIELDS = {
 """The fields an action reads besides the App name and catalog; the form shows only these."""
 DRAFTS_FOLDER = "/Drafts/"
 """Where Databricks can put an imported notebook: a folder people clear out."""
+ROLES_FROM_GROUPS_NOTE = (
+    "Genesis roles from Databricks groups: members of genesis-admins, genesis-power-users "
+    "and genesis-users become Genesis admins, power users and users at their next sign-in. "
+    "Create those groups (Settings -> Identity and access -> Groups) to decide who gets "
+    "which role, or map your own groups on Genesis's Users page"
+)
+"""Postinstall's line telling the admin how to give people Genesis roles without config."""
 OK_MARK = "✔"
 MISSING_MARK = "✘"
 OPTIONAL_MARK = "○"
@@ -834,6 +841,7 @@ def postinstall(client: Any, install: Install, notebook_path: str = "") -> list[
             f"{', '.join(TELEMETRY_TABLES.values())} in that schema, so its logs outlive restarts"
         )
     notes = [unavailable] if unavailable else []
+    notes.append(ROLES_FROM_GROUPS_NOTE)
     if not notebook_path:
         return [
             report,
